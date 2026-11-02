@@ -3,6 +3,7 @@
 
 pub mod gitinfo;
 pub mod keys;
+pub mod message;
 pub mod paths;
 pub mod proc;
 pub mod registry;
@@ -13,3 +14,4 @@ pub mod slug;
 pub mod target;
 pub mod time;
 pub mod transcript;
+pub mod transport;
