@@ -1,0 +1,626 @@
+//! Command orchestration.
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use anyhow::{Context, Result, anyhow, bail};
+
+use crate::cli::{Cli, Cmd, Common, Hold, MapArgs, SendArgs};
+use crate::gitinfo::{self, RootCache, Worktree};
+use crate::keys::KeySet;
+use crate::paths;
+use crate::proc::Liveness;
+use crate::registry::{self, Eligibility, Session};
+use crate::resolve::{self, Decision, GitView, Params, Ranking};
+use crate::routes::Routes;
+use crate::slug::RepoSlug;
+use crate::target::Target;
+use crate::time::{DAY_MS, now_ms};
+use crate::transcript::{self, DestRepo, SessionEvidence};
+use crate::transport;
+use crate::ui;
+use crate::{github, message};
+
+/// How the process should exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Ok,
+    /// Not decisive and no one to ask, or no eligible session.
+    Undecided,
+}
+
+struct Ctx {
+    config: PathBuf,
+    sessions_dir: PathBuf,
+    home: PathBuf,
+    tail: u64,
+    max_age: i64,
+    timing: bool,
+    started: Instant,
+}
+
+impl Ctx {
+    fn new(c: &Common) -> Self {
+        let config = paths::config_dir();
+        Ctx {
+            sessions_dir: paths::sessions_dir(&config),
+            config,
+            home: paths::home(),
+            tail: c.tail_mib.max(1) << 20,
+            max_age: c.max_age_days.max(1) * DAY_MS,
+            timing: c.timing,
+            started: Instant::now(),
+        }
+    }
+
+    fn phase(&self, name: &str) {
+        if self.timing {
+            eprintln!("[timing] {name}: {} ms", self.started.elapsed().as_millis());
+        }
+    }
+}
+
+/// Registry entries split into eligible sessions and excluded ones.
+struct Sessions {
+    eligible: Vec<Session>,
+    excluded: Vec<(Session, String)>,
+}
+
+fn load_sessions(ctx: &Ctx) -> Sessions {
+    let me = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+    let mut eligible = Vec::new();
+    let mut excluded = Vec::new();
+    for s in registry::load_all(&ctx.sessions_dir) {
+        if me.as_deref() == Some(s.session_id.as_str()) {
+            excluded.push((s, "this session".into()));
+            continue;
+        }
+        match (s.liveness(), s.eligibility()) {
+            (Liveness::Live, Eligibility::Eligible) => eligible.push(s),
+            (Liveness::Live, Eligibility::NoSocket) => excluded.push((s, "no inbox socket".into())),
+            (Liveness::Live, Eligibility::Protocol(v)) => {
+                excluded.push((s, format!("peer protocol {v}")))
+            }
+            (Liveness::Dead, _) => excluded.push((s, "not running".into())),
+            (Liveness::Recycled, _) => excluded.push((s, "PID reused".into())),
+        }
+    }
+    Sessions { eligible, excluded }
+}
+
+/// Everything the resolver needs.
+struct World {
+    ev: Vec<SessionEvidence>,
+    git: GitView,
+    keys: KeySet,
+}
+
+/// Run the pipeline phases: fetch targets while reading tails,
+/// then scan, describe worktrees, and gather tag and push facts.
+fn gather<F>(ctx: &Ctx, sessions: &[Session], fetch: F) -> Result<(Vec<Target>, World)>
+where
+    F: FnOnce() -> Result<Vec<Target>> + Send,
+{
+    let (targets, tails) = std::thread::scope(|scope| {
+        let gh = scope.spawn(fetch);
+        let readers: Vec<_> = sessions
+            .iter()
+            .map(|s| {
+                let config = &ctx.config;
+                let tail = ctx.tail;
+                scope.spawn(move || {
+                    paths::transcript_path(config, &s.cwd, &s.session_id)
+                        .map(|p| transcript::read_tail(&p, tail))
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+        let tails: Vec<Vec<u8>> = readers
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect();
+        let targets = gh.join().map_err(|_| anyhow!("GitHub fetch panicked"))?;
+        Ok::<_, anyhow::Error>((targets, tails))
+    })?;
+    let targets = targets?;
+    ctx.phase("fetch + read");
+
+    let specs: Vec<_> = targets.iter().flat_map(Target::key_specs).collect();
+    let keys = KeySet::build(&specs);
+    let roots = RootCache::default();
+    let ev: Vec<SessionEvidence> = std::thread::scope(|scope| {
+        let handles: Vec<_> = sessions
+            .iter()
+            .zip(&tails)
+            .map(|(s, buf)| {
+                let (keys, roots, home) = (&keys, &roots, &ctx.home);
+                scope.spawn(move || transcript::scan(s, buf, keys, home, roots))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("scan thread"))
+            .collect()
+    });
+    ctx.phase("scan");
+
+    let git = describe_world(&ev);
+    ctx.phase("git");
+    Ok((targets, World { ev, git, keys }))
+}
+
+fn describe_world(ev: &[SessionEvidence]) -> GitView {
+    let mut all_roots: Vec<PathBuf> = ev
+        .iter()
+        .flat_map(|e| {
+            e.roots
+                .keys()
+                .cloned()
+                .chain(e.publications.iter().map(|p| p.root.clone()))
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    all_roots.sort();
+    let mut worktrees: HashMap<PathBuf, Worktree> = HashMap::new();
+    for chunk in all_roots.chunks(16) {
+        let described: Vec<(PathBuf, Option<Worktree>)> = std::thread::scope(|scope| {
+            let hs: Vec<_> = chunk
+                .iter()
+                .map(|r| scope.spawn(move || (r.clone(), gitinfo::describe(r))))
+                .collect();
+            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        worktrees.extend(described.into_iter().filter_map(|(r, w)| Some((r, w?))));
+    }
+
+    let mut names: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut remotes: HashSet<(PathBuf, PathBuf, String)> = HashSet::new();
+    for e in ev {
+        for p in &e.publications {
+            let Some(w) = worktrees.get(&p.root) else {
+                continue;
+            };
+            names
+                .entry(w.common_dir.clone())
+                .or_default()
+                .extend(p.dest_refs.iter().chain(&p.sources).cloned());
+            if let DestRepo::Remote(r) = &p.dest_repo {
+                remotes.insert((p.root.clone(), w.git_dir.clone(), r.clone()));
+            }
+        }
+    }
+    let tags = names
+        .into_iter()
+        .map(|(dir, set)| {
+            let list: Vec<String> = set.into_iter().collect();
+            let check = gitinfo::tags_named(&dir, &list);
+            (dir, check)
+        })
+        .collect();
+    let push_slugs = remotes
+        .into_iter()
+        .map(|(root, git_dir, r)| {
+            let slug = gitinfo::push_slug(&root, &r);
+            ((git_dir, r), slug)
+        })
+        .collect();
+    GitView {
+        worktrees,
+        tags,
+        push_slugs,
+    }
+}
+
+fn rank(ctx: &Ctx, world: &World, routes: &Routes, t: &Target) -> Ranking {
+    let view = routes.live_view(&t.route_keys());
+    resolve::resolve(
+        t,
+        &world.ev,
+        &world.git,
+        &view,
+        &world.keys,
+        Params {
+            now: now_ms(),
+            max_age: ctx.max_age,
+        },
+    )
+}
+
+/// Entry point.
+pub fn run(cli: Cli) -> Result<Exit> {
+    match cli.cmd {
+        Some(Cmd::List(c)) => list(&c),
+        Some(Cmd::Map(m)) => map(&m),
+        Some(Cmd::Resolve(r)) => {
+            let ctx = Ctx::new(&r.common);
+            let (slug, n) = r.target.validate()?;
+            explain_one(&ctx, &slug, n, r.target.issue, None).map(|_| Exit::Ok)
+        }
+        None => send(&cli.send),
+    }
+}
+
+fn explain_one(
+    ctx: &Ctx,
+    slug: &RepoSlug,
+    n: u64,
+    issue: bool,
+    to: Option<&Session>,
+) -> Result<()> {
+    let sessions = load_sessions(ctx);
+    let (targets, world) = gather(ctx, &sessions.eligible, || {
+        github::fetch(slug, n, issue).map(|t| vec![t])
+    })?;
+    let (routes, warn) = Routes::load(&paths::state_dir());
+    if let Some(w) = warn {
+        eprintln!("warning: {w}");
+    }
+    let t = &targets[0];
+    let r = rank(ctx, &world, &routes, t);
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{} — {}", t.key(), t.title())?;
+    if let Some(s) = to {
+        writeln!(out, "  --to: {} (pid {})", s.name, s.pid)?;
+    }
+    ui::explain(&r, &world.ev, &ctx.home, &mut out)?;
+    Ok(())
+}
+
+fn list(c: &Common) -> Result<Exit> {
+    let ctx = Ctx::new(c);
+    let sessions = load_sessions(&ctx);
+    let (_, world) = gather(&ctx, &sessions.eligible, || Ok(Vec::new()))?;
+    let mut out = std::io::stdout().lock();
+    for e in &world.ev {
+        let s = &e.session;
+        writeln!(
+            out,
+            "{} [{}] pid {} · {}",
+            s.name,
+            s.status,
+            s.pid,
+            e.title().unwrap_or("(no title)")
+        )?;
+        let mut roots: Vec<_> = e.roots.iter().collect();
+        roots.sort_by_key(|(_, t)| std::cmp::Reverse((t.work, t.reference)));
+        for (root, t) in roots.into_iter().take(3) {
+            let w = world.git.worktrees.get(root);
+            writeln!(
+                out,
+                "    {} work {} ref {} · {} @ {}",
+                paths::display_home(root, &ctx.home),
+                t.work,
+                t.reference,
+                w.and_then(|w| w.branch.as_deref()).unwrap_or("-"),
+                w.and_then(|w| w.head_oid.as_deref())
+                    .map_or("-", |o| &o[..8.min(o.len())])
+            )?;
+        }
+    }
+    for (s, why) in &sessions.excluded {
+        writeln!(out, "{} pid {} — excluded: {why}", s.name, s.pid)?;
+    }
+    Ok(Exit::Ok)
+}
+
+fn map(m: &MapArgs) -> Result<Exit> {
+    let ctx = Ctx::new(&m.common);
+    let repos: Vec<RepoSlug> = m
+        .repos
+        .iter()
+        .map(|r| RepoSlug::parse(r).ok_or_else(|| anyhow!("invalid repository {r:?}")))
+        .collect::<Result<_>>()?;
+    let sessions = load_sessions(&ctx);
+    let (targets, world) = gather(&ctx, &sessions.eligible, || {
+        github::fetch_my_open_prs(&repos).map(|v| v.into_iter().map(Target::Pr).collect())
+    })?;
+    let (routes, _) = Routes::load(&paths::state_dir());
+    let mut out = std::io::stdout().lock();
+    let mut rows = Vec::new();
+    for t in &targets {
+        let r = rank(&ctx, &world, &routes, t);
+        let head = match t {
+            Target::Pr(p) => p.head_ref.clone(),
+            Target::Issue(_) => String::new(),
+        };
+        let decision = match r.decision {
+            Decision::Auto(_) => "auto",
+            Decision::Pick { .. } if r.top().is_some_and(|c| c.score > 0.0) => "pick",
+            Decision::Pick { .. } | Decision::NoCandidates => "none",
+        };
+        let top = r.top().filter(|c| c.score > 0.0);
+        if m.json {
+            rows.push(serde_json::json!({
+                "target": t.key(),
+                "head": head,
+                "decision": decision,
+                "candidates": r.candidates.iter().map(|c| serde_json::json!({
+                    "name": world.ev[c.session].session.name,
+                    "pid": c.pid,
+                    "score": c.score,
+                    "worktree": c.worktree,
+                    "signals": c.signals().map(|s| serde_json::json!({
+                        "id": s.id, "points": s.points, "reason": s.reason
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            }));
+            continue;
+        }
+        writeln!(
+            out,
+            "{:<28} {:<34} {:<4} {}",
+            t.key(),
+            head,
+            decision,
+            top.map(|c| ui::candidate_line(c, &world.ev, &ctx.home))
+                .unwrap_or_default()
+        )?;
+        if m.explain {
+            ui::explain(&r, &world.ev, &ctx.home, &mut out)?;
+        }
+    }
+    if m.json {
+        serde_json::to_writer_pretty(&mut out, &rows)?;
+        writeln!(out)?;
+    }
+    ctx.phase("resolve");
+    Ok(Exit::Ok)
+}
+
+/// Whether `s` has the 8-4-4-4-12 hexadecimal form of a session id.
+fn is_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Match `--to` against eligible sessions.
+fn match_to<'a>(to: &str, sessions: &'a [Session]) -> Result<&'a Session> {
+    let is_uuid = is_uuid(to);
+    let hits: Vec<&Session> = if to.bytes().all(|b| b.is_ascii_digit()) {
+        sessions
+            .iter()
+            .filter(|s| s.pid.to_string() == to)
+            .collect()
+    } else if is_uuid {
+        sessions.iter().filter(|s| s.session_id == to).collect()
+    } else {
+        sessions.iter().filter(|s| s.name == to).collect()
+    };
+    match hits.as_slice() {
+        [one] => Ok(one),
+        _ => {
+            let names: Vec<String> = sessions
+                .iter()
+                .map(|s| format!("{} ({})", s.name, s.pid))
+                .collect();
+            bail!(
+                "--to {to:?} matches {} eligible sessions; eligible: {}",
+                hits.len(),
+                names.join(", ")
+            )
+        }
+    }
+}
+
+fn send(a: &SendArgs) -> Result<Exit> {
+    let result = send_inner(a);
+    let failed = !matches!(result, Ok(Exit::Ok));
+    if let Err(e) = &result {
+        eprintln!("error: {e:#}");
+    }
+    // `--dry-run` takes no input at all.
+    match a.hold {
+        _ if a.dry_run => {}
+        Hold::Always => ui::hold(),
+        Hold::Error if failed => ui::hold(),
+        _ => {}
+    }
+    match result {
+        Ok(x) => Ok(x),
+        Err(_) => std::process::exit(1),
+    }
+}
+
+fn send_inner(a: &SendArgs) -> Result<Exit> {
+    let ctx = Ctx::new(&a.common);
+    let (slug, n) = a.target.validate()?;
+    let sessions = load_sessions(&ctx);
+    let to =
+        a.to.as_deref()
+            .map(|t| match_to(t, &sessions.eligible))
+            .transpose()?;
+    if a.dry_run {
+        explain_one(&ctx, &slug, n, a.target.issue, to)?;
+        return Ok(Exit::Ok);
+    }
+    let (targets, world) = gather(&ctx, &sessions.eligible, || {
+        github::fetch(&slug, n, a.target.issue).map(|t| vec![t])
+    })?;
+    let target = &targets[0];
+    let (mut routes, warn) = Routes::load(&paths::state_dir());
+    if let Some(w) = warn {
+        eprintln!("warning: {w}");
+    }
+    let ranking = rank(&ctx, &world, &routes, target);
+    eprintln!("{} — {}", target.key(), target.title());
+    if a.explain {
+        ui::explain(
+            &ranking,
+            &world.ev,
+            &ctx.home,
+            &mut std::io::stderr().lock(),
+        )?;
+    }
+
+    // Choose the session.
+    let (chosen_idx, picked): (Option<usize>, bool) = if let Some(s) = to {
+        (world.ev.iter().position(|e| e.session.pid == s.pid), true)
+    } else {
+        match ranking.decision {
+            Decision::NoCandidates => {
+                eprintln!("no eligible Claude Code session");
+                return Ok(Exit::Undecided);
+            }
+            Decision::Auto(i) if !a.pick => (Some(ranking.candidates[i].session), false),
+            _ => {
+                if !ui::is_interactive() {
+                    eprintln!("not decisive; candidates:");
+                    ui::explain(
+                        &ranking,
+                        &world.ev,
+                        &ctx.home,
+                        &mut std::io::stderr().lock(),
+                    )?;
+                    return Ok(Exit::Undecided);
+                }
+                match ui::pick(&ranking, &world.ev, &ctx.home)? {
+                    Some(row) => (Some(ranking.candidates[row].session), true),
+                    None => {
+                        eprintln!("cancelled; nothing sent");
+                        return Ok(Exit::Ok);
+                    }
+                }
+            }
+        }
+    };
+    let Some(idx) = chosen_idx else {
+        bail!("the --to session has no evidence entry");
+    };
+    let chosen = world.ev[idx].session.clone();
+    let candidate = ranking.candidates.iter().find(|c| c.session == idx);
+    if let Some(c) = candidate {
+        eprintln!("→ {}", ui::candidate_line(c, &world.ev, &ctx.home));
+    } else {
+        eprintln!("→ {} (pid {})", chosen.name, chosen.pid);
+    }
+
+    // The instruction.
+    let src = match (a.message.as_deref(), a.editor) {
+        (Some("-"), _) => ui::InstructionSource::Stdin,
+        (Some(t), _) => ui::InstructionSource::Text(t),
+        (None, true) => ui::InstructionSource::Editor,
+        (None, false) => ui::InstructionSource::Prompt,
+    };
+    let text = ui::instruction(src)?;
+    if text.is_empty() {
+        eprintln!("empty instruction; nothing sent");
+        return Ok(Exit::Ok);
+    }
+
+    // Re-check the chosen process.
+    let Some(now) = registry::load_one(&ctx.sessions_dir, chosen.pid) else {
+        bail!(
+            "target changed: {} (pid {}) is no longer registered; nothing sent",
+            chosen.name,
+            chosen.pid
+        );
+    };
+    if now.liveness() != Liveness::Live
+        || now.proc_start != chosen.proc_start
+        || now.socket != chosen.socket
+    {
+        bail!(
+            "target changed: {} (pid {}) restarted or moved its inbox; nothing sent",
+            chosen.name,
+            chosen.pid
+        );
+    }
+    let mut session_id = chosen.session_id.clone();
+    if now.session_id != chosen.session_id {
+        if !ui::is_interactive() {
+            eprintln!(
+                "the session was cleared (/clear) meanwhile; not sending without confirmation"
+            );
+            return Ok(Exit::Undecided);
+        }
+        if !ui::confirm("the session was cleared (/clear) meanwhile; send anyway?")? {
+            eprintln!("cancelled; nothing sent");
+            return Ok(Exit::Ok);
+        }
+        session_id = now.session_id.clone();
+    }
+    let socket: &Path = now
+        .socket
+        .as_deref()
+        .context("the session has no inbox socket")?;
+
+    let worktree = candidate.and_then(|c| c.worktree.as_deref());
+    let body = message::build(target, worktree, &ctx.home, &text);
+    let (frame, msg_id) = transport::encode(&body, &session_id, a.priority)?;
+    let token = transport::token_for(socket, &ctx.sessions_dir);
+    let result = transport::send(socket, token.as_deref(), &frame, transport::SEND_TIMEOUT);
+    if picked
+        && !matches!(result, Err(transport::SendError::NotSent(_)))
+        && let Err(e) = routes.record(&target.key(), &now, now_ms())
+    {
+        eprintln!("warning: could not remember the route: {e:#}");
+    }
+    match result {
+        Ok(()) => {
+            println!(
+                "sent to {} (msg {msg_id}); delivery unconfirmed{}",
+                chosen.name,
+                if token.is_none() {
+                    " (no auth key: unauthenticated)"
+                } else {
+                    ""
+                }
+            );
+            Ok(Exit::Ok)
+        }
+        Err(e) => bail!("{e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(pid: u32, id: &str, name: &str) -> Session {
+        Session {
+            pid,
+            session_id: id.into(),
+            cwd: "/".into(),
+            name: name.into(),
+            name_source: "derived".into(),
+            kind: "interactive".into(),
+            status: "idle".into(),
+            proc_start: "1".into(),
+            socket: Some("/x.sock".into()),
+            peer_protocol: 1,
+        }
+    }
+
+    #[test]
+    fn to_matches_pid_session_id_or_unique_name() {
+        let all = vec![
+            s(10, "11111111-2222-4333-8444-555555555555", "tf-a"),
+            s(11, "22222222-3333-4444-8555-666666666666", "tf-b"),
+            s(12, "33333333-4444-4555-8666-777777777777", "tf-b"),
+        ];
+        assert_eq!(match_to("10", &all).unwrap().pid, 10);
+        assert_eq!(
+            match_to("22222222-3333-4444-8555-666666666666", &all)
+                .unwrap()
+                .pid,
+            11
+        );
+        assert_eq!(match_to("tf-a", &all).unwrap().pid, 10);
+        assert!(match_to("tf-b", &all).is_err(), "ambiguous name");
+        assert!(match_to("99", &all).is_err());
+        let named = vec![s(13, "x", "projectname-review-session-docs-bot0")];
+        assert_eq!(
+            match_to("projectname-review-session-docs-bot0", &named)
+                .unwrap()
+                .pid,
+            13
+        );
+    }
+}

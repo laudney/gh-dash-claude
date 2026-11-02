@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::slug::RepoSlug;
 
@@ -74,14 +74,6 @@ impl TagCheck {
 /// child runs in its own process group, which is killed on timeout, and
 /// the output is collected under the same deadline.
 pub fn run_git(args: &[&str]) -> Option<String> {
-    use std::os::unix::process::CommandExt;
-    static SIGCHLD_DEFAULT: std::sync::Once = std::sync::Once::new();
-    // An inherited ignored SIGCHLD makes the kernel reap children at once,
-    // which breaks the unreaped-leader guarantee below.
-    // SAFETY: restores the default disposition of one signal.
-    SIGCHLD_DEFAULT.call_once(|| unsafe {
-        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-    });
     let mut cmd = Command::new("git");
     for (k, _) in std::env::vars_os() {
         let name = k.to_string_lossy();
@@ -95,72 +87,14 @@ pub fn run_git(args: &[&str]) -> Option<String> {
             cmd.env_remove(k);
         }
     }
-    let mut child = cmd
-        .args(args)
+    cmd.args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()?;
-    let pgid = child.id() as libc::pid_t;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let deadline = Instant::now() + GIT_TIMEOUT;
-    let pid = child.id() as libc::id_t;
-    // Wait for the leader to exit *without reaping it*, so its PID (and so
-    // its process group id) cannot be reused before the cleanup below.
-    let exited = loop {
-        // SAFETY: zeroed siginfo_t is a valid out-parameter for waitid.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waits on our own child; WNOWAIT leaves it unreaped.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        // SAFETY: si_pid is valid to read after a successful waitid.
-        if rc == 0 && unsafe { info.si_pid() } != 0 {
-            break true;
-        }
-        if rc != 0 {
-            // ECHILD: the child was reaped behind our back, so its group id
-            // may be reused; never signal it.
-            return None;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    };
-    let out = if exited {
-        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .ok()
-    } else {
-        None
-    };
-    if out.is_none() {
-        // Timeout, or a descendant still holds stdout open. The leader is
-        // unreaped, so the group id still names our group.
-        // SAFETY: signals the child's own process group only.
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    }
-    let status = child.wait().ok()?;
-    let out = out?;
-    status
+        .env("LC_ALL", "C");
+    let out = crate::proc::run_bounded(&mut cmd, GIT_TIMEOUT)?;
+    out.status
         .success()
-        .then(|| String::from_utf8_lossy(&out).into_owned())
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Describe the worktree at `root`, or `None` when git cannot.
@@ -488,6 +422,7 @@ impl RootCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     /// Convert `key value` lines to `git config -z` records.
     fn z(lines: &str) -> String {
