@@ -4,5 +4,6 @@
 pub mod paths;
 pub mod proc;
 pub mod registry;
+pub mod shellparse;
 pub mod slug;
 pub mod time;
