@@ -104,7 +104,11 @@ pub struct SendArgs {
     /// Print every signal of every candidate.
     #[arg(long)]
     pub explain: bool,
-    /// Wait for Enter before exiting, so gh-dash does not hide the output.
+    /// Use line prompts instead of the dialog.
+    #[arg(long)]
+    pub plain: bool,
+    /// Wait for Enter before exiting, so gh-dash does not hide the output
+    /// (line prompts only; the dialog has its own result screen).
     #[arg(long, value_enum, default_value_t = Hold::Error)]
     pub hold: Hold,
     #[command(flatten)]

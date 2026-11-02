@@ -16,9 +16,32 @@ pub fn is_interactive() -> bool {
 }
 
 fn read_line() -> Result<Option<String>> {
+    use std::io::IsTerminal;
+    // Drop input that arrived before the prompt (terminal replies, focus
+    // events left over from gh-dash).
+    if std::io::stdin().is_terminal() {
+        // SAFETY: flushes the input queue of our own stdin terminal.
+        unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+    }
     let mut line = String::new();
     let n = std::io::stdin().lock().read_line(&mut line)?;
-    Ok((n > 0).then(|| line.trim_end_matches(['\n', '\r']).to_string()))
+    Ok((n > 0).then(|| sanitize(&line)))
+}
+
+/// Keep only the typed text of a line: escape sequences and terminal
+/// replies are decoded and dropped.
+pub fn sanitize(line: &str) -> String {
+    use crate::keydec::{Decoder, Key};
+    let mut d = Decoder::new();
+    let mut keys = d.feed(line.as_bytes(), 0);
+    keys.extend(d.tick(1_000));
+    keys.into_iter()
+        .filter_map(|k| match k {
+            Key::Char(c) => Some(c.to_string()),
+            Key::Paste(p) => Some(p),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A one-line summary of a candidate.
@@ -167,5 +190,17 @@ pub fn hold() {
         eprint!("press Enter to return ");
         let _ = std::io::stderr().flush();
         let _ = read_line();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_drops_replies_and_keeps_text() {
+        assert_eq!(sanitize("\x1b[I\x1b]11;rgb:0/0/0\x1b\\\n"), "");
+        assert_eq!(sanitize("2\n"), "2");
+        assert_eq!(sanitize("\x1b[O q\r\n"), " q");
     }
 }

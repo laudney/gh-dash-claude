@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::{Cli, Cmd, Common, Hold, MapArgs, SendArgs};
+use crate::dialog::{self, Compose, Outcome, Row};
 use crate::gitinfo::{self, RootCache, Worktree};
 use crate::keys::KeySet;
 use crate::paths;
@@ -20,6 +21,7 @@ use crate::target::Target;
 use crate::time::{DAY_MS, now_ms};
 use crate::transcript::{self, DestRepo, SessionEvidence};
 use crate::transport;
+use crate::tui::{Interrupted, Tui};
 use crate::ui;
 use crate::{github, message};
 
@@ -31,6 +33,7 @@ pub enum Exit {
     Undecided,
 }
 
+#[derive(Clone)]
 struct Ctx {
     config: PathBuf,
     sessions_dir: PathBuf,
@@ -409,15 +412,21 @@ fn match_to<'a>(to: &str, sessions: &'a [Session]) -> Result<&'a Session> {
     }
 }
 
+/// Set when the dialog was used, so `--hold` does not wait a second time.
+static MODAL_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn send(a: &SendArgs) -> Result<Exit> {
     let result = send_inner(a);
     let failed = !matches!(result, Ok(Exit::Ok));
     if let Err(e) = &result {
         eprintln!("error: {e:#}");
     }
-    // `--dry-run` takes no input at all.
+    // `--dry-run` takes no input at all; the dialog has its own
+    // result screen.
+    let modal = MODAL_USED.load(std::sync::atomic::Ordering::SeqCst);
+    // After a termination signal, never wait for input.
     match a.hold {
-        _ if a.dry_run => {}
+        _ if a.dry_run || modal || crate::tui::signalled() => {}
         Hold::Always => ui::hold(),
         Hold::Error if failed => ui::hold(),
         _ => {}
@@ -428,93 +437,88 @@ fn send(a: &SendArgs) -> Result<Exit> {
     }
 }
 
-fn send_inner(a: &SendArgs) -> Result<Exit> {
-    let ctx = Ctx::new(&a.common);
-    let (slug, n) = a.target.validate()?;
-    let sessions = load_sessions(&ctx);
-    let to =
-        a.to.as_deref()
-            .map(|t| match_to(t, &sessions.eligible))
-            .transpose()?;
-    if a.dry_run {
-        explain_one(&ctx, &slug, n, a.target.issue, to)?;
-        return Ok(Exit::Ok);
-    }
-    let (targets, world) = gather(&ctx, &sessions.eligible, || {
-        github::fetch(&slug, n, a.target.issue).map(|t| vec![t])
+/// Everything a send needs once resolution is done.
+struct Prepared {
+    target: Target,
+    world: World,
+    ranking: Ranking,
+    routes: Routes,
+    warnings: Vec<String>,
+}
+
+fn prepare(
+    ctx: &Ctx,
+    eligible: &[Session],
+    slug: &RepoSlug,
+    n: u64,
+    issue: bool,
+) -> Result<Prepared> {
+    let (mut targets, world) = gather(ctx, eligible, || {
+        github::fetch(slug, n, issue).map(|t| vec![t])
     })?;
-    let target = &targets[0];
-    let (mut routes, warn) = Routes::load(&paths::state_dir());
-    if let Some(w) = warn {
-        eprintln!("warning: {w}");
-    }
-    let ranking = rank(&ctx, &world, &routes, target);
-    eprintln!("{} — {}", target.key(), target.title());
-    if a.explain {
-        ui::explain(
-            &ranking,
-            &world.ev,
-            &ctx.home,
-            &mut std::io::stderr().lock(),
-        )?;
-    }
+    let target = targets.remove(0);
+    let (routes, warn) = Routes::load(&paths::state_dir());
+    let ranking = rank(ctx, &world, &routes, &target);
+    Ok(Prepared {
+        target,
+        world,
+        ranking,
+        routes,
+        warnings: warn.into_iter().collect(),
+    })
+}
 
-    // Choose the session.
-    let (chosen_idx, picked): (Option<usize>, bool) = if let Some(s) = to {
-        (world.ev.iter().position(|e| e.session.pid == s.pid), true)
-    } else {
-        match ranking.decision {
-            Decision::NoCandidates => {
-                eprintln!("no eligible Claude Code session");
-                return Ok(Exit::Undecided);
-            }
-            Decision::Auto(i) if !a.pick => (Some(ranking.candidates[i].session), false),
-            _ => {
-                if !ui::is_interactive() {
-                    eprintln!("not decisive; candidates:");
-                    ui::explain(
-                        &ranking,
-                        &world.ev,
-                        &ctx.home,
-                        &mut std::io::stderr().lock(),
-                    )?;
-                    return Ok(Exit::Undecided);
-                }
-                match ui::pick(&ranking, &world.ev, &ctx.home)? {
-                    Some(row) => (Some(ranking.candidates[row].session), true),
-                    None => {
-                        eprintln!("cancelled; nothing sent");
-                        return Ok(Exit::Ok);
-                    }
-                }
-            }
+/// What a delivery produced, printed once the terminal is restored.
+struct Report {
+    exit: Exit,
+    out: Option<String>,
+    err: Vec<String>,
+}
+
+impl Report {
+    fn print(&self) {
+        for e in &self.err {
+            eprintln!("{e}");
         }
-    };
-    let Some(idx) = chosen_idx else {
-        bail!("the --to session has no evidence entry");
-    };
-    let chosen = world.ev[idx].session.clone();
-    let candidate = ranking.candidates.iter().find(|c| c.session == idx);
-    if let Some(c) = candidate {
-        eprintln!("→ {}", ui::candidate_line(c, &world.ev, &ctx.home));
-    } else {
-        eprintln!("→ {} (pid {})", chosen.name, chosen.pid);
+        if let Some(o) = &self.out {
+            println!("{o}");
+        }
+    }
+}
+
+/// Where a confirmation question goes.
+enum Asker<'a> {
+    Line,
+    Modal(&'a mut Tui, &'a str),
+}
+
+impl Asker<'_> {
+    fn interactive(&self) -> bool {
+        match self {
+            Asker::Line => ui::is_interactive(),
+            Asker::Modal(..) => true,
+        }
     }
 
-    // The instruction.
-    let src = match (a.message.as_deref(), a.editor) {
-        (Some("-"), _) => ui::InstructionSource::Stdin,
-        (Some(t), _) => ui::InstructionSource::Text(t),
-        (None, true) => ui::InstructionSource::Editor,
-        (None, false) => ui::InstructionSource::Prompt,
-    };
-    let text = ui::instruction(src)?;
-    if text.is_empty() {
-        eprintln!("empty instruction; nothing sent");
-        return Ok(Exit::Ok);
+    fn confirm(&mut self, q: &str) -> Result<bool> {
+        match self {
+            Asker::Line => ui::confirm(q),
+            Asker::Modal(t, title) => t.confirm(title, q),
+        }
     }
+}
 
-    // Re-check the chosen process.
+/// Re-check the chosen process and send.
+fn deliver(
+    ctx: &Ctx,
+    a: &SendArgs,
+    prep: &mut Prepared,
+    idx: usize,
+    picked: bool,
+    text: &str,
+    asker: &mut Asker<'_>,
+) -> Result<Report> {
+    let chosen = prep.world.ev[idx].session.clone();
     let Some(now) = registry::load_one(&ctx.sessions_dir, chosen.pid) else {
         bail!(
             "target changed: {} (pid {}) is no longer registered; nothing sent",
@@ -534,15 +538,22 @@ fn send_inner(a: &SendArgs) -> Result<Exit> {
     }
     let mut session_id = chosen.session_id.clone();
     if now.session_id != chosen.session_id {
-        if !ui::is_interactive() {
-            eprintln!(
-                "the session was cleared (/clear) meanwhile; not sending without confirmation"
-            );
-            return Ok(Exit::Undecided);
+        if !asker.interactive() {
+            return Ok(Report {
+                exit: Exit::Undecided,
+                out: None,
+                err: vec![
+                    "the session was cleared (/clear) meanwhile; not sending without confirmation"
+                        .into(),
+                ],
+            });
         }
-        if !ui::confirm("the session was cleared (/clear) meanwhile; send anyway?")? {
-            eprintln!("cancelled; nothing sent");
-            return Ok(Exit::Ok);
+        if !asker.confirm("the session was cleared (/clear) meanwhile; send anyway?")? {
+            return Ok(Report {
+                exit: Exit::Ok,
+                out: None,
+                err: vec!["cancelled; nothing sent".into()],
+            });
         }
         session_id = now.session_id.clone();
     }
@@ -551,20 +562,31 @@ fn send_inner(a: &SendArgs) -> Result<Exit> {
         .as_deref()
         .context("the session has no inbox socket")?;
 
+    let candidate = prep.ranking.candidates.iter().find(|c| c.session == idx);
     let worktree = candidate.and_then(|c| c.worktree.as_deref());
-    let body = message::build(target, worktree, &ctx.home, &text);
+    let body = message::build(&prep.target, worktree, &ctx.home, text);
     let (frame, msg_id) = transport::encode(&body, &session_id, a.priority)?;
     let token = transport::token_for(socket, &ctx.sessions_dir);
+    if let Asker::Modal(t, title) = asker {
+        let _ = t.show(title, &format!("sending to {}…", chosen.name));
+    }
+    // The last point at which a signal still means "nothing sent" (for
+    // both UIs: a signal caught by the dialog stays recorded).
+    if crate::tui::signalled() {
+        return Err(Interrupted.into());
+    }
     let result = transport::send(socket, token.as_deref(), &frame, transport::SEND_TIMEOUT);
+    let mut err = Vec::new();
     if picked
         && !matches!(result, Err(transport::SendError::NotSent(_)))
-        && let Err(e) = routes.record(&target.key(), &now, now_ms())
+        && let Err(e) = prep.routes.record(&prep.target.key(), &now, now_ms())
     {
-        eprintln!("warning: could not remember the route: {e:#}");
+        err.push(format!("warning: could not remember the route: {e:#}"));
     }
     match result {
-        Ok(()) => {
-            println!(
+        Ok(()) => Ok(Report {
+            exit: Exit::Ok,
+            out: Some(format!(
                 "sent to {} (msg {msg_id}); delivery unconfirmed{}",
                 chosen.name,
                 if token.is_none() {
@@ -572,10 +594,363 @@ fn send_inner(a: &SendArgs) -> Result<Exit> {
                 } else {
                     ""
                 }
-            );
-            Ok(Exit::Ok)
+            )),
+            err,
+        }),
+        Err(e) => {
+            // Keep warnings in the error, so nothing prints over a dialog.
+            let mut msg = e.to_string();
+            for w in err {
+                msg.push('\n');
+                msg.push_str(&w);
+            }
+            bail!("{msg}")
         }
-        Err(e) => bail!("{e}"),
+    }
+}
+
+fn send_inner(a: &SendArgs) -> Result<Exit> {
+    let ctx = Ctx::new(&a.common);
+    let (slug, n) = a.target.validate()?;
+    let sessions = load_sessions(&ctx);
+    let to =
+        a.to.as_deref()
+            .map(|t| match_to(t, &sessions.eligible))
+            .transpose()?;
+    if a.dry_run {
+        explain_one(&ctx, &slug, n, a.target.issue, to)?;
+        return Ok(Exit::Ok);
+    }
+    let issue = a.target.issue;
+    // Mode order: the first matching case below wins.
+    let dialog = ui::is_interactive() && !a.plain && a.message.as_deref() != Some("-");
+    let direct_to = a.message.is_some() && !a.pick && to.is_some();
+    if !dialog || direct_to {
+        let prep = prepare(&ctx, &sessions.eligible, &slug, n, issue)?;
+        return line_flow(&ctx, a, prep, to);
+    }
+    if a.message.is_some() && !a.pick {
+        let prep = prepare(&ctx, &sessions.eligible, &slug, n, issue)?;
+        if matches!(prep.ranking.decision, Decision::Auto(_)) {
+            return line_flow(&ctx, a, prep, to);
+        }
+        return modal_flow(
+            &ctx,
+            a,
+            Source::Ready(Box::new(prep)),
+            to,
+            &slug,
+            n,
+            &sessions.eligible,
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        // `--timing` would print over the dialog: silence it there.
+        let mut ctx = ctx.clone();
+        ctx.timing = false;
+        let eligible = sessions.eligible.clone();
+        let slug = slug.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(prepare(&ctx, &eligible, &slug, n, issue));
+        });
+    }
+    modal_flow(
+        &ctx,
+        a,
+        Source::Pending(rx),
+        to,
+        &slug,
+        n,
+        &sessions.eligible,
+    )
+}
+
+/// The line-based flow (today's behaviour; also the fallback).
+fn line_flow(ctx: &Ctx, a: &SendArgs, mut prep: Prepared, to: Option<&Session>) -> Result<Exit> {
+    for w in &prep.warnings {
+        eprintln!("warning: {w}");
+    }
+    let (world, ranking) = (&prep.world, &prep.ranking);
+    eprintln!("{} — {}", prep.target.key(), prep.target.title());
+    if a.explain {
+        ui::explain(ranking, &world.ev, &ctx.home, &mut std::io::stderr().lock())?;
+    }
+    let (chosen_idx, picked): (Option<usize>, bool) = if let Some(s) = to {
+        (world.ev.iter().position(|e| e.session.pid == s.pid), true)
+    } else {
+        match ranking.decision {
+            Decision::NoCandidates => {
+                eprintln!("no eligible Claude Code session");
+                return Ok(Exit::Undecided);
+            }
+            Decision::Auto(i) if !a.pick => (Some(ranking.candidates[i].session), false),
+            _ => {
+                if !ui::is_interactive() {
+                    eprintln!("not decisive; candidates:");
+                    ui::explain(ranking, &world.ev, &ctx.home, &mut std::io::stderr().lock())?;
+                    return Ok(Exit::Undecided);
+                }
+                match ui::pick(ranking, &world.ev, &ctx.home)? {
+                    Some(row) => (Some(ranking.candidates[row].session), true),
+                    None => {
+                        eprintln!("cancelled; nothing sent");
+                        return Ok(Exit::Ok);
+                    }
+                }
+            }
+        }
+    };
+    let Some(idx) = chosen_idx else {
+        bail!("the --to session has no evidence entry");
+    };
+    match ranking.candidates.iter().find(|c| c.session == idx) {
+        Some(c) => eprintln!("→ {}", ui::candidate_line(c, &world.ev, &ctx.home)),
+        None => eprintln!(
+            "→ {} (pid {})",
+            world.ev[idx].session.name, world.ev[idx].session.pid
+        ),
+    }
+    let src = match (a.message.as_deref(), a.editor) {
+        (Some("-"), _) => ui::InstructionSource::Stdin,
+        (Some(t), _) => ui::InstructionSource::Text(t),
+        (None, true) => ui::InstructionSource::Editor,
+        (None, false) => ui::InstructionSource::Prompt,
+    };
+    let text = ui::instruction(src)?;
+    if text.is_empty() {
+        eprintln!("empty instruction; nothing sent");
+        return Ok(Exit::Ok);
+    }
+    let report = deliver(ctx, a, &mut prep, idx, picked, &text, &mut Asker::Line)?;
+    report.print();
+    Ok(report.exit)
+}
+
+/// How the dialog gets the resolution.
+enum Source {
+    Ready(Box<Prepared>),
+    Pending(std::sync::mpsc::Receiver<Result<Prepared>>),
+}
+
+impl Source {
+    fn wait(self) -> Result<Prepared> {
+        match self {
+            Source::Ready(p) => Ok(*p),
+            Source::Pending(rx) => rx
+                .recv()
+                .map_err(|_| anyhow!("the resolution thread stopped unexpectedly"))?,
+        }
+    }
+}
+
+fn interrupted() -> anyhow::Error {
+    anyhow!("interrupted; nothing sent")
+}
+
+/// The dialog flow.
+#[allow(clippy::too_many_arguments)]
+fn modal_flow(
+    ctx: &Ctx,
+    a: &SendArgs,
+    source: Source,
+    to: Option<&Session>,
+    slug: &RepoSlug,
+    n: u64,
+    eligible: &[Session],
+) -> Result<Exit> {
+    let mut tui = match Tui::enter() {
+        Ok(t) => t,
+        Err(e) if e.is::<Interrupted>() => return Err(interrupted()),
+        // No usable terminal: the line UI.
+        Err(_) => return line_flow(ctx, a, source.wait()?, to),
+    };
+    let title = format!("Send to Claude — {slug}#{n}");
+    let prep = match source {
+        Source::Ready(p) => Ok(*p),
+        Source::Pending(rx) => {
+            let text = format!(
+                "fetching from GitHub and scanning {} sessions…",
+                eligible.len()
+            );
+            match tui.loading(&title, &text, &rx) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    drop(tui);
+                    eprintln!("cancelled; nothing sent");
+                    return Ok(Exit::Ok);
+                }
+                Err(e) => {
+                    drop(tui);
+                    return Err(if e.is::<Interrupted>() {
+                        interrupted()
+                    } else {
+                        e
+                    });
+                }
+            }
+        }
+    };
+    let mut prep = match prep {
+        Ok(p) => p,
+        Err(e) => {
+            drop(tui);
+            return Err(e);
+        }
+    };
+
+    // The rows: every candidate, or only the pinned `--to` session.
+    let indices: Vec<usize> = match to {
+        Some(s) => prep
+            .ranking
+            .candidates
+            .iter()
+            .position(|c| c.pid == s.pid)
+            .into_iter()
+            .collect(),
+        None => (0..prep.ranking.candidates.len()).collect(),
+    };
+    if indices.is_empty() {
+        drop(tui);
+        for w in &prep.warnings {
+            eprintln!("warning: {w}");
+        }
+        eprintln!("no eligible Claude Code session");
+        return Ok(Exit::Undecided);
+    }
+    let rows: Vec<Row> = indices
+        .iter()
+        .map(|&ci| {
+            let c = &prep.ranking.candidates[ci];
+            let e = &prep.world.ev[c.session];
+            let mut details: Vec<String> = e
+                .title()
+                .map(|t| format!("title: {t}"))
+                .into_iter()
+                .collect();
+            details.extend(
+                c.signals()
+                    .take(3)
+                    .map(|s| format!("{} {:>5.1}  {}", s.id, s.points, s.reason)),
+            );
+            Row {
+                line: ui::candidate_line(c, &prep.world.ev, &ctx.home),
+                details,
+            }
+        })
+        .collect();
+    let verdict = match (to, prep.ranking.decision) {
+        (Some(_), _) => "--to: pinned session".to_string(),
+        (None, Decision::Auto(_)) => "decisive: one owner".to_string(),
+        (None, _) => "not decisive — choose the session".to_string(),
+    };
+    let mut c = Compose::new(
+        title.clone(),
+        prep.target.title().to_string(),
+        verdict,
+        rows,
+    );
+    if let Some(m) = a.message.as_deref() {
+        c.text = m.chars().collect();
+        c.cursor = c.text.len();
+        c.fixed_text = true;
+    }
+    c.needs_text = !a.editor;
+    let outcome = match tui.compose(&mut c) {
+        Ok(o) => o,
+        Err(e) => {
+            drop(tui);
+            return Err(if e.is::<Interrupted>() {
+                interrupted()
+            } else {
+                e
+            });
+        }
+    };
+    if outcome == Outcome::Cancel {
+        drop(tui);
+        explain_after(ctx, a, &prep);
+        eprintln!("cancelled; nothing sent");
+        return Ok(Exit::Ok);
+    }
+    let ci = indices[c.selected];
+    let idx = prep.ranking.candidates[ci].session;
+    let picked = dialog::picked(prep.ranking.decision, ci, a.pick, to.is_some());
+
+    if a.editor {
+        drop(tui);
+        explain_after(ctx, a, &prep);
+        if crate::tui::signalled() {
+            return Err(interrupted());
+        }
+        let text = ui::instruction(ui::InstructionSource::Editor)?;
+        if text.is_empty() {
+            eprintln!("empty instruction; nothing sent");
+            return Ok(Exit::Ok);
+        }
+        let report =
+            deliver(ctx, a, &mut prep, idx, picked, &text, &mut Asker::Line).map_err(|e| {
+                if e.is::<Interrupted>() {
+                    interrupted()
+                } else {
+                    e
+                }
+            })?;
+        report.print();
+        return Ok(report.exit);
+    }
+
+    let text = c.instruction();
+    let result = deliver(
+        ctx,
+        a,
+        &mut prep,
+        idx,
+        picked,
+        &text,
+        &mut Asker::Modal(&mut tui, &title),
+    );
+    match result {
+        Ok(report) => {
+            let (msg, ok) = match &report.out {
+                Some(o) => (o.clone(), true),
+                None => (report.err.join("\n"), false),
+            };
+            if !msg.is_empty() {
+                MODAL_USED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = tui.message(&title, &msg, ok);
+            }
+            drop(tui);
+            for w in &prep.warnings {
+                eprintln!("warning: {w}");
+            }
+            explain_after(ctx, a, &prep);
+            report.print();
+            Ok(report.exit)
+        }
+        Err(e) if e.is::<Interrupted>() => {
+            drop(tui);
+            Err(interrupted())
+        }
+        Err(e) => {
+            MODAL_USED.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tui.message(&title, &format!("{e:#}"), false);
+            drop(tui);
+            explain_after(ctx, a, &prep);
+            Err(e)
+        }
+    }
+}
+
+/// `--explain` in dialog mode: printed after the terminal is restored.
+fn explain_after(ctx: &Ctx, a: &SendArgs, prep: &Prepared) {
+    if a.explain {
+        let _ = ui::explain(
+            &prep.ranking,
+            &prep.world.ev,
+            &ctx.home,
+            &mut std::io::stderr().lock(),
+        );
     }
 }
 

@@ -3,8 +3,10 @@
 
 pub mod app;
 pub mod cli;
+pub mod dialog;
 pub mod github;
 pub mod gitinfo;
+pub mod keydec;
 pub mod keys;
 pub mod message;
 pub mod paths;
@@ -18,4 +20,5 @@ pub mod target;
 pub mod time;
 pub mod transcript;
 pub mod transport;
+pub mod tui;
 pub mod ui;
