@@ -2,9 +2,11 @@
 //! live Claude Code session that owns it.
 
 pub mod gitinfo;
+pub mod keys;
 pub mod paths;
 pub mod proc;
 pub mod registry;
 pub mod shellparse;
 pub mod slug;
 pub mod time;
+pub mod transcript;
