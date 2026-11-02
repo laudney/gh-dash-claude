@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/laudney/gh-dash-claude"
+
+[package]
+name = "gh-dash-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Route an instruction for a GitHub PR or issue from gh-dash to the Claude Code session that owns it"
+readme = "README.md"
+keywords = ["gh-dash", "claude-code", "github", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+aho-corasick = "1.1"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+jiff = "0.2"
+libc = "0.2"
+memchr = "2.8"
+regex = "1.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+sha2 = "0.11"
+tempfile = "3.27"
+uuid = { version = "1.29", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
