@@ -10,6 +10,8 @@ worktrees, and push to a fork, while the PR lives upstream. gh-dash-claude
 reads the evidence sessions leave behind and sends automatically only when
 exactly one session owns the PR; otherwise it asks, with the best candidate
 already selected. See [`docs/how-matching-works.md`](docs/how-matching-works.md).
+The inbox protocol itself is described in
+[`docs/claude-code-peer-protocol.md`](docs/claude-code-peer-protocol.md).
 
 ## Requirements
 
