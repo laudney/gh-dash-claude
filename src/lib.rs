@@ -26,3 +26,4 @@ pub mod transport;
 pub mod tui;
 pub mod ui;
 pub mod watch;
+pub mod watcher;

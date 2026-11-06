@@ -33,6 +33,7 @@ pub fn run(cli: Cli) -> Result<Exit> {
     match cli.cmd {
         Some(Cmd::List(c)) => list(&c),
         Some(Cmd::Map(m)) => map(&m),
+        Some(Cmd::Watch(w)) => crate::watcher::run(&w),
         Some(Cmd::Resolve(r)) => {
             let ctx = Ctx::new(&r.common);
             let (slug, n) = r.target.validate()?;

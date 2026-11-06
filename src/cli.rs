@@ -1,5 +1,7 @@
 //! Command-line interface.
 
+use std::path::PathBuf;
+
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -30,6 +32,9 @@ pub enum Cmd {
     Map(MapArgs),
     /// List Claude Code sessions with the worktrees they work in.
     List(Common),
+    /// Poll your open PRs and forward new review comments to the session
+    /// that owns each PR, only when exactly one session owns it.
+    Watch(WatchArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -138,6 +143,59 @@ pub struct MapArgs {
     pub common: Common,
 }
 
+/// The largest accepted `--lookback` / `--pending-hours`: ten years.
+pub const MAX_HOURS: u64 = 87_600;
+
+/// Whose human comments `watch` forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Authors {
+    /// Repository owners, members and collaborators.
+    Maintainers,
+    /// Every human except you.
+    Anyone,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct WatchArgs {
+    /// Poll once, then exit.
+    #[arg(long)]
+    pub once: bool,
+    /// Seconds between polls (at least 30).
+    #[arg(long, default_value_t = 120, value_name = "SECS",
+          value_parser = clap::value_parser!(u64).range(30..))]
+    pub interval: u64,
+    /// Limit to these repositories (repeatable).
+    #[arg(long = "repo", value_name = "OWNER/NAME")]
+    pub repos: Vec<String>,
+    /// Whose human comments to forward.
+    #[arg(long, value_enum, default_value_t = Authors::Maintainers)]
+    pub from: Authors,
+    /// Do not forward reviews and inline comments from review bots.
+    #[arg(long)]
+    pub no_bots: bool,
+    /// On first start only: also forward comments from the last HOURS.
+    #[arg(long, default_value_t = 0, value_name = "HOURS",
+          value_parser = clap::value_parser!(u64).range(0..=MAX_HOURS))]
+    pub lookback: u64,
+    /// Drop a comment that found no decisive owner within HOURS.
+    #[arg(long, default_value_t = 24, value_name = "HOURS",
+          value_parser = clap::value_parser!(u64).range(1..=MAX_HOURS))]
+    pub pending_hours: u64,
+    /// Replace the instruction that precedes the comments.
+    #[arg(long, value_name = "TEXT")]
+    pub instruction: Option<String>,
+    /// Read the instruction from a file.
+    #[arg(long, value_name = "PATH", conflicts_with = "instruction")]
+    pub instruction_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = Priority::Next)]
+    pub priority: Priority,
+    /// Poll and print what would be sent: no socket, no file written.
+    #[arg(long)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    pub common: Common,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +225,49 @@ mod tests {
             Some(Cmd::Resolve(_))
         ));
         assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn watch_defaults_and_limits() {
+        let Some(Cmd::Watch(w)) = parse(&["watch"]).unwrap().cmd else {
+            panic!("watch is a subcommand");
+        };
+        assert_eq!((w.interval, w.pending_hours, w.lookback), (120, 24, 0));
+        assert_eq!(w.from, Authors::Maintainers);
+        assert_eq!(w.priority, Priority::Next);
+        assert!(!w.once && !w.dry_run && !w.no_bots);
+
+        let Some(Cmd::Watch(w)) = parse(&[
+            "watch",
+            "--once",
+            "--dry-run",
+            "--interval",
+            "30",
+            "--repo",
+            "a/b",
+            "--from",
+            "anyone",
+            "--no-bots",
+            "--lookback",
+            "48",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!()
+        };
+        assert!(w.once && w.dry_run && w.no_bots);
+        assert_eq!((w.interval, w.lookback), (30, 48));
+        assert_eq!(
+            (w.repos, w.from),
+            (vec!["a/b".to_string()], Authors::Anyone)
+        );
+
+        assert!(parse(&["watch", "--interval", "29"]).is_err());
+        assert!(parse(&["watch", "--pending-hours", "0"]).is_err());
+        assert!(parse(&["watch", "--pending-hours", "87601"]).is_err());
+        assert!(parse(&["watch", "--lookback", "18446744073709551615"]).is_err());
+        assert!(parse(&["watch", "--instruction", "x", "--instruction-file", "f"]).is_err());
     }
 
     #[test]
