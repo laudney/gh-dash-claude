@@ -87,7 +87,59 @@ gh-dash-claude list                          # running sessions and their worktr
 gh-dash-claude map                           # every open PR you authored → its owner
 gh-dash-claude resolve owner/repo 123        # why a PR would go where it goes
 gh-dash-claude owner/repo 123 --dry-run      # the same, from the send command
+gh-dash-claude watch --once --dry-run        # what the watcher would forward now
 ```
+
+## Forward review comments automatically
+
+`gh-dash-claude watch` polls your open PRs and, when a maintainer or a review
+bot leaves new feedback, sends it to the session that owns the PR, asking it
+to assess each comment and act on it.
+
+- **What it forwards** — conversation comments, reviews, and inline review
+  comments from the base repository's owners, members and collaborators,
+  plus reviews and inline comments from review bots. Your own comments and
+  bot conversation comments (CI, coverage, previews) are never forwarded.
+  `--from anyone` includes every human (useful when maintainers keep their
+  organisation membership private); `--no-bots` leaves bots out.
+- **Only when sure** — it sends only when exactly one session owns the PR,
+  the same rule under which the gh-dash key sends without asking. Otherwise
+  the comments wait in a queue and are retried on every poll for
+  `--pending-hours` (default 24), then dropped. Picking the session once with
+  the gh-dash key is enough to make it decisive. After `/clear`, a session
+  picked earlier must be picked again.
+- **Never twice** — a comment is recorded as delivered before it is sent, so
+  a crash can lose a message but never repeat one.
+- **No flood** — on first start, history is ignored; `--lookback HOURS`
+  includes recent comments once.
+
+Try it first; this reads GitHub, transcripts and git, and writes nothing:
+
+```sh
+gh-dash-claude watch --once --dry-run --lookback 24
+```
+
+Run it as a systemd user service:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/gh-dash-claude-watch.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now gh-dash-claude-watch
+journalctl --user -u gh-dash-claude-watch -f     # what it queues and sends
+```
+
+The unit runs `~/.cargo/bin/gh-dash-claude watch`; edit `ExecStart=` to add
+options or another path. The service needs `gh` logged in for your user; if
+`gh` keeps its token in a keyring the service cannot reach, set `GH_TOKEN` in
+an `EnvironmentFile=` (the unit shows where). The queue lives in
+`~/.local/state/gh-dash-claude/watch.json`; one watcher runs at a time.
+
+Each poll is one paginated GitHub GraphQL search, about 10 points per page
+of 25 PRs out of 5,000 per hour; at the default 2-minute interval that is a
+small part of the allowance. Raise `--interval` if you have hundreds of
+open PRs. Rate limits are respected: the watcher waits for GitHub's retry
+time.
 
 ## Troubleshooting
 
@@ -111,6 +163,11 @@ gh-dash-claude <REPO> <NUMBER> [--issue] [-m TEXT | -m -] [--editor]
 gh-dash-claude resolve <REPO> <NUMBER> [--issue]
 gh-dash-claude map [--repo OWNER/NAME]... [--json] [--explain]
 gh-dash-claude list
+gh-dash-claude watch [--once] [--interval SECS] [--repo OWNER/NAME]...
+                     [--from maintainers|anyone] [--no-bots]
+                     [--lookback HOURS] [--pending-hours HOURS]
+                     [--instruction TEXT | --instruction-file PATH]
+                     [--priority now|next|later] [--dry-run]
 ```
 
 A send reports `sent to <session> (msg <id>); delivery unconfirmed`: the

@@ -1,0 +1,18 @@
+# Forward new PR review comments to the Claude Code session that owns
+# each PR. Install: see "Forward review comments automatically" in the
+# README.
+[Unit]
+Description=Forward PR review comments to the owning Claude Code session
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/gh-dash-claude watch
+Restart=on-failure
+RestartSec=60
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# If gh cannot read its token from a keyring inside the service, put
+# GH_TOKEN=... in this file (mode 0600) and uncomment the line:
+#EnvironmentFile=%h/.config/gh-dash-claude/watch.env
+
+[Install]
+WantedBy=default.target
