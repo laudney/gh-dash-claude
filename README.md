@@ -136,6 +136,9 @@ systemctl --user enable --now gh-dash-claude-watch
 journalctl --user -u gh-dash-claude-watch -f     # what it queues and sends
 ```
 
+A user service starts when you log in. To start it at boot, without a login,
+run `loginctl enable-linger $USER` once.
+
 The unit runs `~/.cargo/bin/gh-dash-claude watch`; edit `ExecStart=` to add
 options or another path. The service needs `gh` logged in for your user; if
 `gh` keeps its token in a keyring the service cannot reach, set `GH_TOKEN` in
