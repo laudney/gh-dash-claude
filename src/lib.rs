@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod delivery;
 pub mod dialog;
 pub mod github;
 pub mod gitinfo;
