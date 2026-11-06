@@ -1,25 +1,21 @@
 //! Command orchestration.
 
-use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::{Cli, Cmd, Common, Hold, MapArgs, SendArgs};
 use crate::dialog::{self, Compose, Outcome, Row};
-use crate::gitinfo::{self, RootCache, Worktree};
-use crate::keys::KeySet;
 use crate::paths;
+use crate::pipeline::{Ctx, World, gather, load_sessions, rank};
 use crate::proc::Liveness;
-use crate::registry::{self, Eligibility, Session};
-use crate::resolve::{self, Decision, GitView, Params, Ranking};
+use crate::registry::{self, Session};
+use crate::resolve::{Decision, Ranking};
 use crate::routes::Routes;
 use crate::slug::RepoSlug;
 use crate::target::Target;
-use crate::time::{DAY_MS, now_ms};
-use crate::transcript::{self, DestRepo, SessionEvidence};
+use crate::time::now_ms;
 use crate::transport;
 use crate::tui::{Interrupted, Tui};
 use crate::ui;
@@ -31,205 +27,6 @@ pub enum Exit {
     Ok,
     /// Not decisive and no one to ask, or no eligible session.
     Undecided,
-}
-
-#[derive(Clone)]
-struct Ctx {
-    config: PathBuf,
-    sessions_dir: PathBuf,
-    home: PathBuf,
-    tail: u64,
-    max_age: i64,
-    timing: bool,
-    started: Instant,
-}
-
-impl Ctx {
-    fn new(c: &Common) -> Self {
-        let config = paths::config_dir();
-        Ctx {
-            sessions_dir: paths::sessions_dir(&config),
-            config,
-            home: paths::home(),
-            tail: c.tail_mib.max(1) << 20,
-            max_age: c.max_age_days.max(1) * DAY_MS,
-            timing: c.timing,
-            started: Instant::now(),
-        }
-    }
-
-    fn phase(&self, name: &str) {
-        if self.timing {
-            eprintln!("[timing] {name}: {} ms", self.started.elapsed().as_millis());
-        }
-    }
-}
-
-/// Registry entries split into eligible sessions and excluded ones.
-struct Sessions {
-    eligible: Vec<Session>,
-    excluded: Vec<(Session, String)>,
-}
-
-fn load_sessions(ctx: &Ctx) -> Sessions {
-    let me = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-    let mut eligible = Vec::new();
-    let mut excluded = Vec::new();
-    for s in registry::load_all(&ctx.sessions_dir) {
-        if me.as_deref() == Some(s.session_id.as_str()) {
-            excluded.push((s, "this session".into()));
-            continue;
-        }
-        match (s.liveness(), s.eligibility()) {
-            (Liveness::Live, Eligibility::Eligible) => eligible.push(s),
-            (Liveness::Live, Eligibility::NoSocket) => excluded.push((s, "no inbox socket".into())),
-            (Liveness::Live, Eligibility::Protocol(v)) => {
-                excluded.push((s, format!("peer protocol {v}")))
-            }
-            (Liveness::Dead, _) => excluded.push((s, "not running".into())),
-            (Liveness::Recycled, _) => excluded.push((s, "PID reused".into())),
-        }
-    }
-    Sessions { eligible, excluded }
-}
-
-/// Everything the resolver needs.
-struct World {
-    ev: Vec<SessionEvidence>,
-    git: GitView,
-    keys: KeySet,
-}
-
-/// Run the pipeline phases: fetch targets while reading tails,
-/// then scan, describe worktrees, and gather tag and push facts.
-fn gather<F>(ctx: &Ctx, sessions: &[Session], fetch: F) -> Result<(Vec<Target>, World)>
-where
-    F: FnOnce() -> Result<Vec<Target>> + Send,
-{
-    let (targets, tails) = std::thread::scope(|scope| {
-        let gh = scope.spawn(fetch);
-        let readers: Vec<_> = sessions
-            .iter()
-            .map(|s| {
-                let config = &ctx.config;
-                let tail = ctx.tail;
-                scope.spawn(move || {
-                    paths::transcript_path(config, &s.cwd, &s.session_id)
-                        .map(|p| transcript::read_tail(&p, tail))
-                        .unwrap_or_default()
-                })
-            })
-            .collect();
-        let tails: Vec<Vec<u8>> = readers
-            .into_iter()
-            .map(|h| h.join().unwrap_or_default())
-            .collect();
-        let targets = gh.join().map_err(|_| anyhow!("GitHub fetch panicked"))?;
-        Ok::<_, anyhow::Error>((targets, tails))
-    })?;
-    let targets = targets?;
-    ctx.phase("fetch + read");
-
-    let specs: Vec<_> = targets.iter().flat_map(Target::key_specs).collect();
-    let keys = KeySet::build(&specs);
-    let roots = RootCache::default();
-    let ev: Vec<SessionEvidence> = std::thread::scope(|scope| {
-        let handles: Vec<_> = sessions
-            .iter()
-            .zip(&tails)
-            .map(|(s, buf)| {
-                let (keys, roots, home) = (&keys, &roots, &ctx.home);
-                scope.spawn(move || transcript::scan(s, buf, keys, home, roots))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("scan thread"))
-            .collect()
-    });
-    ctx.phase("scan");
-
-    let git = describe_world(&ev);
-    ctx.phase("git");
-    Ok((targets, World { ev, git, keys }))
-}
-
-fn describe_world(ev: &[SessionEvidence]) -> GitView {
-    let mut all_roots: Vec<PathBuf> = ev
-        .iter()
-        .flat_map(|e| {
-            e.roots
-                .keys()
-                .cloned()
-                .chain(e.publications.iter().map(|p| p.root.clone()))
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    all_roots.sort();
-    let mut worktrees: HashMap<PathBuf, Worktree> = HashMap::new();
-    for chunk in all_roots.chunks(16) {
-        let described: Vec<(PathBuf, Option<Worktree>)> = std::thread::scope(|scope| {
-            let hs: Vec<_> = chunk
-                .iter()
-                .map(|r| scope.spawn(move || (r.clone(), gitinfo::describe(r))))
-                .collect();
-            hs.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
-        worktrees.extend(described.into_iter().filter_map(|(r, w)| Some((r, w?))));
-    }
-
-    let mut names: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    let mut remotes: HashSet<(PathBuf, PathBuf, String)> = HashSet::new();
-    for e in ev {
-        for p in &e.publications {
-            let Some(w) = worktrees.get(&p.root) else {
-                continue;
-            };
-            names
-                .entry(w.common_dir.clone())
-                .or_default()
-                .extend(p.dest_refs.iter().chain(&p.sources).cloned());
-            if let DestRepo::Remote(r) = &p.dest_repo {
-                remotes.insert((p.root.clone(), w.git_dir.clone(), r.clone()));
-            }
-        }
-    }
-    let tags = names
-        .into_iter()
-        .map(|(dir, set)| {
-            let list: Vec<String> = set.into_iter().collect();
-            let check = gitinfo::tags_named(&dir, &list);
-            (dir, check)
-        })
-        .collect();
-    let push_slugs = remotes
-        .into_iter()
-        .map(|(root, git_dir, r)| {
-            let slug = gitinfo::push_slug(&root, &r);
-            ((git_dir, r), slug)
-        })
-        .collect();
-    GitView {
-        worktrees,
-        tags,
-        push_slugs,
-    }
-}
-
-fn rank(ctx: &Ctx, world: &World, routes: &Routes, t: &Target) -> Ranking {
-    let view = routes.live_view(&t.route_keys());
-    resolve::resolve(
-        t,
-        &world.ev,
-        &world.git,
-        &view,
-        &world.keys,
-        Params {
-            now: now_ms(),
-            max_age: ctx.max_age,
-        },
-    )
 }
 
 /// Entry point.
@@ -262,7 +59,7 @@ fn explain_one(
         eprintln!("warning: {w}");
     }
     let t = &targets[0];
-    let r = rank(ctx, &world, &routes, t);
+    let r = rank(ctx, &world, &routes.live_view(&t.route_keys()), t);
     let mut out = std::io::stdout().lock();
     writeln!(out, "{} — {}", t.key(), t.title())?;
     if let Some(s) = to {
@@ -324,7 +121,7 @@ fn map(m: &MapArgs) -> Result<Exit> {
     let mut out = std::io::stdout().lock();
     let mut rows = Vec::new();
     for t in &targets {
-        let r = rank(&ctx, &world, &routes, t);
+        let r = rank(&ctx, &world, &routes.live_view(&t.route_keys()), t);
         let head = match t {
             Target::Pr(p) => p.head_ref.clone(),
             Target::Issue(_) => String::new(),
@@ -458,7 +255,12 @@ fn prepare(
     })?;
     let target = targets.remove(0);
     let (routes, warn) = Routes::load(&paths::state_dir());
-    let ranking = rank(ctx, &world, &routes, &target);
+    let ranking = rank(
+        ctx,
+        &world,
+        &routes.live_view(&target.route_keys()),
+        &target,
+    );
     Ok(Prepared {
         target,
         world,
