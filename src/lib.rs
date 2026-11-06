@@ -10,6 +10,7 @@ pub mod keydec;
 pub mod keys;
 pub mod message;
 pub mod paths;
+pub mod pipeline;
 pub mod proc;
 pub mod registry;
 pub mod resolve;
