@@ -106,12 +106,19 @@ to assess each comment and act on it.
   the same rule under which the gh-dash key sends without asking. Otherwise
   the comments wait in a queue and are retried on every poll for
   `--pending-hours` (default 24), then dropped. Picking the session once with
-  the gh-dash key is enough to make it decisive. After `/clear`, a session
-  picked earlier must be picked again.
+  the gh-dash key remembers it as an owner, which settles the common
+  undecided case (no session shows evidence yet); when two sessions both
+  show owner evidence, a pick does not settle it. `gh-dash-claude resolve`
+  shows why a PR is undecided. After `/clear`, a session picked earlier must
+  be picked again.
 - **Never twice** — a comment is recorded as delivered before it is sent, so
   a crash can lose a message but never repeat one.
 - **No flood** — on first start, history is ignored; `--lookback HOURS`
   includes recent comments once.
+- **Limits** — each poll reads the last 50 conversation comments, the last
+  30 reviews, and the first 30 inline comments of each review per PR. More
+  new feedback than that between two polls can be missed; queued comments
+  are kept even after they leave those windows.
 
 Try it first; this reads GitHub, transcripts and git, and writes nothing:
 
