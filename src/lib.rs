@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod proc;
 pub mod registry;
 pub mod resolve;
+pub mod review;
 pub mod routes;
 pub mod shellparse;
 pub mod slug;
