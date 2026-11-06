@@ -111,6 +111,26 @@ impl Routes {
         RouteView { pids, uncertain }
     }
 
+    /// Like `live_view`, for unattended use: a live route whose recorded
+    /// session id differs from the process's current one (`current(pid)`),
+    /// or whose current id cannot be read, makes the view uncertain. A
+    /// choice made before `/clear` does not carry over to the new
+    /// conversation.
+    pub fn live_view_checked(
+        &self,
+        keys: &[String],
+        current: impl Fn(u32) -> Option<String>,
+    ) -> RouteView {
+        let mut view = self.live_view(keys);
+        let stale = keys
+            .iter()
+            .filter_map(|k| self.routes.get(k))
+            .filter(|r| r.live())
+            .any(|r| current(r.pid).as_deref() != Some(r.session_id.as_str()));
+        view.uncertain |= stale;
+        view
+    }
+
     /// Remember `session` for `key`, under an exclusive lock, with an
     /// atomic replace. Routes whose process is no longer live are dropped;
     /// routes to live processes are kept.
@@ -198,6 +218,41 @@ mod tests {
             vec![std::process::id()]
         );
         assert!(r2.live_view(&["a/b#2".into()]).pids.is_empty());
+    }
+
+    #[test]
+    fn checked_view_rejects_cleared_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, _) = Routes::load(dir.path());
+        r.record("a/b#1", &me(), 5).unwrap();
+        let keys = vec!["a/b#1".to_string()];
+
+        let same = r.live_view_checked(&keys, |_| Some("s1".into()));
+        assert_eq!(same.pids, vec![std::process::id()]);
+        assert!(!same.uncertain);
+
+        let cleared = r.live_view_checked(&keys, |_| Some("s2".into()));
+        assert!(cleared.uncertain, "a /clear makes the route uncertain");
+
+        let unreadable = r.live_view_checked(&keys, |_| None);
+        assert!(unreadable.uncertain);
+
+        // The plain view is unchanged.
+        assert!(!r.live_view(&keys).uncertain);
+    }
+
+    #[test]
+    fn checked_view_ignores_dead_routes() {
+        // Written directly: `record` would prune the dead route at once.
+        let dir = tempfile::tempdir().unwrap();
+        let file = serde_json::json!({"version": 1, "routes": {"a/b#9": {
+            "pid": std::process::id(), "procStart": "0", "sessionId": "s1",
+            "name": "me", "at": 1}}});
+        std::fs::write(dir.path().join("routes.json"), file.to_string()).unwrap();
+        let (r, w) = Routes::load(dir.path());
+        assert!(w.is_none() && r.routes.len() == 1);
+        let v = r.live_view_checked(&["a/b#9".into()], |_| Some("other".into()));
+        assert!(v.pids.is_empty() && !v.uncertain);
     }
 
     #[test]
