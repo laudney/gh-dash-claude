@@ -67,6 +67,10 @@ Hints only rank the list:
 - **Otherwise** → the picker shows every session, best first, with row 1
   selected; Enter confirms, and the choice is remembered for this PR.
 - An issue uses the owners of its open linked PRs.
+- **`watch`** has no one to ask, so it sends only in the first case and
+  otherwise keeps the comments queued for a later poll. It is stricter about
+  remembered routes: a route chosen before the session's `/clear` makes the
+  decision uncertain until you pick the session again.
 
 ## Delivery
 
