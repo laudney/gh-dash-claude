@@ -669,10 +669,7 @@ fn parse_feedback_pages<'a>(pages: impl IntoIterator<Item = &'a [u8]>) -> Result
 /// Fetch every open PR authored by the user (optionally limited to some
 /// repositories) with its recent review feedback, in one paginated
 /// GraphQL search with response headers.
-pub fn fetch_my_open_prs_with_feedback(
-    repos: &[RepoSlug],
-    now: i64,
-) -> Result<Feedback, FetchError> {
+pub fn fetch_my_open_prs_with_feedback(repos: &[RepoSlug]) -> Result<Feedback, FetchError> {
     let search = my_open_prs_search(repos);
     let q = format!(
         "query($endCursor: String) {{ viewer {{ login }} rateLimit {{ cost remaining resetAt }} \
@@ -703,6 +700,8 @@ pub fn fetch_my_open_prs_with_feedback(
     let responses = split_responses(&out.stdout);
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // A relative `Retry-After` counts from when the response arrived.
+        let now = crate::time::now_ms();
         if let Some(e) = rate_limit_error(&stderr, responses.last().map(|(h, _)| h), now) {
             return Err(e);
         }
