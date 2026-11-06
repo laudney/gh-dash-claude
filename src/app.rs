@@ -1,16 +1,15 @@
 //! Command orchestration.
 
 use std::io::Write;
-use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::cli::{Cli, Cmd, Common, Hold, MapArgs, SendArgs};
+use crate::delivery::{self, Blocked};
 use crate::dialog::{self, Compose, Outcome, Row};
 use crate::paths;
 use crate::pipeline::{Ctx, World, gather, load_sessions, rank};
-use crate::proc::Liveness;
-use crate::registry::{self, Session};
+use crate::registry::Session;
 use crate::resolve::{Decision, Ranking};
 use crate::routes::Routes;
 use crate::slug::RepoSlug;
@@ -321,24 +320,11 @@ fn deliver(
     asker: &mut Asker<'_>,
 ) -> Result<Report> {
     let chosen = prep.world.ev[idx].session.clone();
-    let Some(now) = registry::load_one(&ctx.sessions_dir, chosen.pid) else {
-        bail!(
-            "target changed: {} (pid {}) is no longer registered; nothing sent",
-            chosen.name,
-            chosen.pid
-        );
+    let now = match delivery::recheck(&ctx.sessions_dir, &chosen) {
+        Ok(now) => now,
+        Err(Blocked::Gone(why)) => bail!("{why}"),
+        Err(Blocked::Cleared { now }) => *now,
     };
-    if now.liveness() != Liveness::Live
-        || now.proc_start != chosen.proc_start
-        || now.socket != chosen.socket
-    {
-        bail!(
-            "target changed: {} (pid {}) restarted or moved its inbox; nothing sent",
-            chosen.name,
-            chosen.pid
-        );
-    }
-    let mut session_id = chosen.session_id.clone();
     if now.session_id != chosen.session_id {
         if !asker.interactive() {
             return Ok(Report {
@@ -357,18 +343,15 @@ fn deliver(
                 err: vec!["cancelled; nothing sent".into()],
             });
         }
-        session_id = now.session_id.clone();
     }
-    let socket: &Path = now
-        .socket
-        .as_deref()
-        .context("the session has no inbox socket")?;
+    // After a confirmed `/clear`, send to the new conversation.
+    let session_id = now.session_id.clone();
 
     let candidate = prep.ranking.candidates.iter().find(|c| c.session == idx);
     let worktree = candidate.and_then(|c| c.worktree.as_deref());
     let body = message::build(&prep.target, worktree, &ctx.home, text);
-    let (frame, msg_id) = transport::encode(&body, &session_id, a.priority)?;
-    let token = transport::token_for(socket, &ctx.sessions_dir);
+    let out = delivery::encode(&now, &session_id, &body, a.priority, &ctx.sessions_dir)?;
+    let (msg_id, token) = (&out.msg_id, &out.token);
     if let Asker::Modal(t, title) = asker {
         let _ = t.show(title, &format!("sending to {}…", chosen.name));
     }
@@ -377,7 +360,7 @@ fn deliver(
     if crate::tui::signalled() {
         return Err(Interrupted.into());
     }
-    let result = transport::send(socket, token.as_deref(), &frame, transport::SEND_TIMEOUT);
+    let result = delivery::send(&out);
     let mut err = Vec::new();
     if picked
         && !matches!(result, Err(transport::SendError::NotSent(_)))
